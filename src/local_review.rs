@@ -506,8 +506,9 @@ async fn review_single_patch(
             );
         }
 
-        let provider =
-            crate::ai::create_provider_from_ai(ai).context("Failed to create AI provider")?;
+        let provider = crate::ai::create_provider_cached_from_ai(ai)
+            .await
+            .context("Failed to create AI provider")?;
         let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
         let prompts_tool_path = Some(options.prompts.join("tool.md"));
 
@@ -559,6 +560,7 @@ async fn review_single_patch(
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,
+                dedup_tool_calls: ai.dedup_tool_calls,
                 custom_prompt: options.custom_prompt.clone(),
                 series_range,
                 baseline_sha: Some(baseline_sha.to_string()),

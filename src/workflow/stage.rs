@@ -46,6 +46,8 @@ pub struct WorkflowEnv<'a> {
     pub tools: Arc<ToolBox>,
     pub base_dir: &'a std::path::Path,
     pub context_tag: Option<String>,
+    /// See AiSettings::dedup_tool_calls.
+    pub dedup_tool_calls: bool,
 }
 
 /// A deferred state mutation function returned after isolated stage execution.
@@ -227,6 +229,61 @@ struct StageSession<'a, S, T> {
     recitation_fallback_active: bool,
     /// Name and arguments of the last call run, for the duplicate guard below.
     last_tool_call: Option<(String, Value)>,
+    /// Every call run in this stage, in order, when dedup_tool_calls is set.
+    /// The guard then catches a model that cycles between several calls rather
+    /// than repeating one immediately.
+    seen_tool_calls: Vec<(String, Value)>,
+    /// See AiSettings::dedup_tool_calls.
+    dedup_tool_calls: bool,
+}
+
+impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> StageSession<'a, S, T> {
+    /// Returns the refusal to hand back when this call repeats an earlier one,
+    /// or None when it should run.
+    ///
+    /// Without dedup_tool_calls only the immediately preceding call is
+    /// compared, which misses a model cycling between several calls.
+    fn duplicate_refusal(&self, name: &str, args: &Value) -> Option<Value> {
+        if self.dedup_tool_calls
+            && let Some(earlier) = self
+                .seen_tool_calls
+                .iter()
+                .position(|seen| seen.0 == name && seen.1 == *args)
+        {
+            tracing::warn!(
+                "Blocked duplicate tool call: {} with args {:?}, already run as call {}",
+                name,
+                args,
+                earlier + 1
+            );
+            return Some(json!({
+                "error": format!(
+                    "Duplicate tool call blocked. Call {} in this stage already ran this exact query and its result is above in the conversation. Change the parameters or use a different tool.",
+                    earlier + 1
+                )
+            }));
+        }
+
+        let repeated = self
+            .last_tool_call
+            .as_ref()
+            .is_some_and(|last| last.0 == name && last.1 == *args);
+        if repeated {
+            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Some(json!({
+                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+            }));
+        }
+        None
+    }
+
+    /// Records a call that is about to run, for the guards above.
+    fn record_tool_call(&mut self, name: &str, args: &Value) {
+        if self.dedup_tool_calls {
+            self.seen_tool_calls.push((name.to_string(), args.clone()));
+        }
+        self.last_tool_call = Some((name.to_string(), args.clone()));
+    }
 }
 
 #[async_trait]
@@ -287,17 +344,10 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
-        let repeated = self
-            .last_tool_call
-            .as_ref()
-            .is_some_and(|last| last.0 == name && last.1 == args);
-        if repeated {
-            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
-            return Ok(json!({
-                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
-            }));
+        if let Some(refusal) = self.duplicate_refusal(name, &args) {
+            return Ok(refusal);
         }
-        self.last_tool_call = Some((name.to_string(), args.clone()));
+        self.record_tool_call(name, &args);
         match self.tools.call(name, args).await {
             Ok(v) => Ok(v),
             Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -309,24 +359,10 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
         let mut to_run = Vec::new();
 
         for (idx, call) in calls.into_iter().enumerate() {
-            let repeated = self
-                .last_tool_call
-                .as_ref()
-                .is_some_and(|last| last.0 == call.function_name && last.1 == call.arguments);
-            if repeated {
-                tracing::warn!(
-                    "Blocked duplicate tool call: {} with args {:?}",
-                    call.function_name,
-                    call.arguments
-                );
-                results[idx] = Some((
-                    call.id,
-                    json!({
-                        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
-                    }),
-                ));
+            if let Some(refusal) = self.duplicate_refusal(&call.function_name, &call.arguments) {
+                results[idx] = Some((call.id, refusal));
             } else {
-                self.last_tool_call = Some((call.function_name.clone(), call.arguments.clone()));
+                self.record_tool_call(&call.function_name, &call.arguments);
                 to_run.push((idx, call));
             }
         }
@@ -436,6 +472,8 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 context_tag: env.context_tag.clone(),
                 recitation_fallback_active: false,
                 last_tool_call: None,
+                seen_tool_calls: Vec::new(),
+                dedup_tool_calls: env.dedup_tool_calls,
             };
 
             let runner = SessionRunner::new(env.provider.as_ref())
@@ -632,6 +670,7 @@ mod tests {
             tools: Arc::new(toolbox),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_concurrent")
@@ -658,6 +697,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup")
@@ -702,6 +742,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_turns")
@@ -746,6 +787,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_gap")
@@ -777,6 +819,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_non_consecutive_duplicate_is_blocked_when_dedup_is_set() {
+        // The mirror of the test above: with dedup_tool_calls the second "a"
+        // is refused even though "b" separates it from the first, which is the
+        // case a model cycling between calls produces.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "b", "a"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            dedup_tool_calls: true,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_gap_dedup")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a refused repeat must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert!(
+            !replies[0].contains("Duplicate tool call blocked")
+                && !replies[1].contains("Duplicate tool call blocked"),
+            "the first two are distinct and must run: {replies:?}"
+        );
+        assert!(
+            replies[2].contains("Duplicate tool call blocked"),
+            "the repeat of the first call must be refused: {}",
+            replies[2]
+        );
+        assert!(
+            replies[2].contains("Call 1"),
+            "the refusal names the earlier call: {}",
+            replies[2]
+        );
+    }
+
+    #[tokio::test]
     async fn test_batched_tool_results_keep_their_call_order() {
         // join_all preserves the input order, which is what keeps a tool
         // result next to its call on the Gemini path, where the result
@@ -788,6 +881,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_batch")
@@ -820,6 +914,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            dedup_tool_calls: false,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_error")
