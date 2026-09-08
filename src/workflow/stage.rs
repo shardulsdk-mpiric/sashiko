@@ -227,28 +227,111 @@ struct StageSession<'a, S, T> {
     recitation_fallback_active: bool,
     /// Name and arguments of the last call run, for the duplicate guard below.
     last_tool_call: Option<(String, Value)>,
+    /// Every read call this stage has run and what it returned, so a repeat
+    /// can be answered from here. Ordered by call number; short enough that a
+    /// scan costs nothing next to the calls themselves.
+    seen_tool_calls: Vec<SeenToolCall>,
+    /// How many calls this stage has run, for numbering in the replay note.
+    tool_calls_run: usize,
 }
 
+/// The result of an earlier call, marked as the repeat of that call.
+fn replayed(result: &Value, call_number: usize) -> Value {
+    let mut replay = result.clone();
+    // Objects carry the note inline. Anything else is handed back unchanged
+    // rather than reshaped, since the shape is the tool's.
+    if let Some(obj) = replay.as_object_mut() {
+        obj.insert(
+            "note".to_string(),
+            json!(format!(
+                "This is the unchanged result of call {call_number} in this stage, \
+                 which is already above in the conversation. The tree has not \
+                 changed since. Use it and move on."
+            )),
+        );
+    }
+    replay
+}
+
+/// What a repeat is told when there is no result to hand back.
+fn no_result_to_replay() -> Value {
+    json!({
+        "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
+    })
+}
+
+/// One completed tool call and its result.
+struct SeenToolCall {
+    call_number: usize,
+    name: String,
+    args: Value,
+    result: Value,
+}
+
+/// Upper bound on remembered results. Each is already held in the
+/// conversation, so remembering it roughly doubles that much memory; past
+/// this point new calls simply are not remembered and the consecutive guard
+/// below still applies.
+const MAX_REMEMBERED_TOOL_CALLS: usize = 256;
+
 impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> StageSession<'a, S, T> {
-    /// Returns what to hand back when this call repeats one already made in
-    /// this stage, or None when it should run.
-    fn answer_from_earlier_call(&self, name: &str, args: &Value) -> Option<Value> {
-        let repeated = self
-            .last_tool_call
-            .as_ref()
-            .is_some_and(|last| last.0 == name && last.1 == *args);
-        if repeated {
-            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
-            return Some(json!({
-                "error": "Duplicate tool call blocked. Please change parameters or use a different tool."
-            }));
+    /// The result of an earlier call in this stage that this one repeats, or
+    /// None when there is no such result to hand back.
+    fn replay_remembered(&self, name: &str, args: &Value) -> Option<Value> {
+        if let Some(seen) = self
+            .seen_tool_calls
+            .iter()
+            .find(|seen| seen.name == name && seen.args == *args)
+        {
+            tracing::warn!(
+                "Repeat of call {}: {} with args {:?}; replaying its result",
+                seen.call_number,
+                name,
+                args
+            );
+            return Some(replayed(&seen.result, seen.call_number));
         }
         None
     }
 
-    /// Records a call that is about to run, for the guard above.
-    fn record_tool_call(&mut self, name: &str, args: &Value) {
+    /// Whether this call repeats the one immediately before it, which is what
+    /// the guard has always blocked.
+    fn repeats_last_call(&self, name: &str, args: &Value) -> bool {
+        self.last_tool_call
+            .as_ref()
+            .is_some_and(|last| last.0 == name && last.1 == *args)
+    }
+
+    /// Records a call that is about to run, for the guard above. Returns its
+    /// number within the stage.
+    fn record_tool_call(&mut self, name: &str, args: &Value) -> usize {
         self.last_tool_call = Some((name.to_string(), args.clone()));
+        self.tool_calls_run += 1;
+        self.tool_calls_run
+    }
+
+    /// Remembers a completed call so a later repeat of it can be answered
+    /// from the result. Failures are not remembered: the error is not what
+    /// the model asked for, and the call may well succeed on a retry.
+    fn remember_tool_call(
+        &mut self,
+        call_number: usize,
+        name: String,
+        args: Value,
+        result: &Value,
+    ) {
+        if self.seen_tool_calls.len() >= MAX_REMEMBERED_TOOL_CALLS {
+            return;
+        }
+        if result.get("error").is_some() {
+            return;
+        }
+        self.seen_tool_calls.push(SeenToolCall {
+            call_number,
+            name,
+            args,
+            result: result.clone(),
+        });
     }
 }
 
@@ -310,32 +393,64 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
-        if let Some(reply) = self.answer_from_earlier_call(name, &args) {
+        if let Some(reply) = self.replay_remembered(name, &args) {
             return Ok(reply);
         }
-        self.record_tool_call(name, &args);
-        match self.tools.call(name, args).await {
-            Ok(v) => Ok(v),
-            Err(e) => Ok(json!({ "error": e.to_string() })),
+        // A repeat whose result was not remembered, because it failed or
+        // because the cap was reached. Nothing to hand back, so say so.
+        if self.repeats_last_call(name, &args) {
+            tracing::warn!("Blocked duplicate tool call: {} with args {:?}", name, args);
+            return Ok(no_result_to_replay());
         }
+        let call_number = self.record_tool_call(name, &args);
+        let result = match self.tools.call(name, args.clone()).await {
+            Ok(v) => v,
+            Err(e) => json!({ "error": e.to_string() }),
+        };
+        self.remember_tool_call(call_number, name.to_string(), args, &result);
+        Ok(result)
     }
 
     async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
         let mut results: Vec<Option<(String, Value)>> = vec![None; calls.len()];
-        let mut to_run = Vec::new();
+        let mut to_run: Vec<(usize, ToolCall, usize)> = Vec::new();
+        // Repeats of a call queued earlier in this same batch, as (this call,
+        // the one it repeats, its id, that call's number).
+        let mut sharing: Vec<(usize, usize, String, usize)> = Vec::new();
 
         for (idx, call) in calls.into_iter().enumerate() {
-            if let Some(reply) = self.answer_from_earlier_call(&call.function_name, &call.arguments)
-            {
+            if let Some(reply) = self.replay_remembered(&call.function_name, &call.arguments) {
                 results[idx] = Some((call.id, reply));
-            } else {
-                self.record_tool_call(&call.function_name, &call.arguments);
-                to_run.push((idx, call));
+                continue;
             }
+            if self.repeats_last_call(&call.function_name, &call.arguments) {
+                tracing::warn!(
+                    "Blocked duplicate tool call: {} with args {:?}",
+                    call.function_name,
+                    call.arguments
+                );
+                // The call it repeats is queued in this same batch and has not
+                // run yet, so there is nothing remembered to replay. Wait for
+                // it and share its result rather than refusing outright.
+                match to_run.last() {
+                    Some((first_idx, queued, call_number))
+                        if queued.function_name == call.function_name
+                            && queued.arguments == call.arguments =>
+                    {
+                        sharing.push((idx, *first_idx, call.id, *call_number));
+                    }
+                    _ => results[idx] = Some((call.id, no_result_to_replay())),
+                }
+                continue;
+            }
+            let call_number = self.record_tool_call(&call.function_name, &call.arguments);
+            to_run.push((idx, call, call_number));
         }
 
-        let futures = to_run.into_iter().map(|(idx, call)| {
+        let futures = to_run.into_iter().map(|(idx, call, call_number)| {
             let tools = self.tools.clone();
+            let name = call.function_name.clone();
+            let args = call.arguments.clone();
             async move {
                 // A rejected call is the model's to read and correct. The
                 // trait default propagates the error instead, which ends the
@@ -344,11 +459,22 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                     Ok(v) => v,
                     Err(e) => json!({ "error": e.to_string() }),
                 };
-                (idx, (call.id, res))
+                (idx, call_number, name, args, (call.id, res))
             }
         });
-        for (idx, res) in futures::future::join_all(futures).await {
+        for (idx, call_number, name, args, res) in futures::future::join_all(futures).await {
+            self.remember_tool_call(call_number, name, args, &res.1);
             results[idx] = Some(res);
+        }
+
+        for (idx, first_idx, id, call_number) in sharing {
+            let reply = match results[first_idx].as_ref() {
+                Some((_, value)) if value.get("error").is_none() => replayed(value, call_number),
+                // The call it repeats failed, so there is still nothing to
+                // hand back.
+                _ => no_result_to_replay(),
+            };
+            results[idx] = Some((id, reply));
         }
 
         Ok(results.into_iter().flatten().collect())
@@ -439,6 +565,8 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 context_tag: env.context_tag.clone(),
                 recitation_fallback_active: false,
                 last_tool_call: None,
+                seen_tool_calls: Vec::new(),
+                tool_calls_run: 0,
             };
 
             let runner = SessionRunner::new(env.provider.as_ref())
@@ -546,6 +674,26 @@ mod tests {
             }
         }
 
+        /// One call to the counting read tool per path. These succeed, so a
+        /// test can tell a replayed result from a fresh run.
+        fn reading(paths: &[&str]) -> Self {
+            Self {
+                turn: Mutex::new(0),
+                seen: Mutex::new(Vec::new()),
+                calls: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| ToolCall {
+                        id: format!("call_{i}"),
+                        function_name: "counting_read".to_string(),
+                        arguments: json!({ "path": path }),
+                        thought_signature: None,
+                    })
+                    .collect(),
+                calling_turns: 1,
+            }
+        }
+
         /// Emit the same batch again on the next turn, so a test can reach the
         /// duplicate guard across two call_tools invocations.
         fn repeated_next_turn(mut self) -> Self {
@@ -589,6 +737,36 @@ mod tests {
                 model_name: "mock".to_string(),
                 context_window_size: 100_000,
             }
+        }
+    }
+
+    /// Succeeds, and counts how many times it was actually run, so a test can
+    /// tell a replayed result from a fresh one.
+    struct CountingRead {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::toolbox::framework::LlmTool<crate::toolbox::SashikoToolContext> for CountingRead {
+        fn name(&self) -> &'static str {
+            "counting_read"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that succeeds and counts its runs."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": { "path": { "type": "string" } } })
+        }
+
+        async fn call(
+            &self,
+            args: Value,
+            _context: &crate::toolbox::SashikoToolContext,
+        ) -> Result<Value> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "contents": format!("body of {}", args["path"]) }))
         }
     }
 
@@ -690,6 +868,153 @@ mod tests {
         assert!(
             replies[1].contains("Duplicate tool call blocked"),
             "the repeat is blocked: {}",
+            replies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeat_of_a_successful_call_replays_its_result() {
+        // The model asked for a file, then asked for the same file again on
+        // the next turn. What it wanted both times is the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::reading(&["a"]).repeated_next_turn());
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(CountingRead { runs: runs.clone() });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_replay_turns")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a repeat must not end the stage");
+
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the repeat is answered from the first run, not by running again"
+        );
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[2]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies[1].contains("body of"),
+            "the repeat gets the file it asked for: {}",
+            replies[1]
+        );
+        assert!(
+            replies[1].contains("call 1"),
+            "and is told which earlier call it came from: {}",
+            replies[1]
+        );
+        assert!(
+            !replies[1].contains("Duplicate tool call blocked"),
+            "nothing is refused: {}",
+            replies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeat_inside_one_batch_replays_the_result() {
+        // Both halves of the guard have to agree, so the same repeat arriving
+        // inside a single batch is answered the same way.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::reading(&["a", "a"]));
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(CountingRead { runs: runs.clone() });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_replay_batch")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a repeat must not end the stage");
+
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call in the batch does not run"
+        );
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies.iter().all(|r| r.contains("body of")),
+            "both halves get the file: {:?}",
+            replies
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeat_of_a_failed_call_is_still_refused() {
+        // A failure is not the answer to the question, and the call may well
+        // succeed on a retry, so nothing is remembered to replay. The repeat
+        // falls through to the refusal, which is what the tests above and
+        // below this one already pin.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "a"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("tool_replay_failed")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a repeat must not end the stage");
+
+        let seen = provider.seen.lock().unwrap();
+        let replies: Vec<String> = seen[1]
+            .messages
+            .iter()
+            .filter(|m| m.role == AiRole::Tool)
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies[1].contains("Duplicate tool call blocked"),
+            "a failure is not replayed as if it were an answer: {}",
             replies[1]
         );
     }
