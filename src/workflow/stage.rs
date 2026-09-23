@@ -227,6 +227,67 @@ struct StageSession<'a, S, T> {
     recitation_fallback_active: bool,
     /// Name and arguments of the last call run, for the duplicate guard below.
     last_tool_call: Option<(String, Value)>,
+    /// Numbers this execution of the stage in logs and in the tool trace.
+    stage_run: u64,
+    /// Tool call batches received so far, one per model turn that called tools.
+    batches: u64,
+    /// Tool calls received so far. Counted only while a trace is recorded.
+    calls_seen: u64,
+    /// For each exact name and arguments pair seen in this stage, the number
+    /// of the first call and of the most recent one. Kept only while tracing.
+    seen: std::collections::HashMap<String, (u64, u64)>,
+}
+
+/// What the trace records about one tool call.
+struct TracedCall {
+    seq: u64,
+    name: String,
+    args: Value,
+    repeat_of: Option<u64>,
+    prev_seq: Option<u64>,
+    refused: bool,
+    cache_hit: bool,
+}
+
+impl<S, T> StageSession<'_, S, T> {
+    /// The patch tag with this stage and its run number appended.
+    fn tag(&self) -> String {
+        format!(
+            "{}[{}#{}] ",
+            self.context_tag.as_deref().unwrap_or(""),
+            self.stage.name,
+            self.stage_run
+        )
+    }
+
+    /// Numbers a call and notes whether an identical one came earlier in this
+    /// stage. Arguments are compared as the model sent them, before any
+    /// normalization, so this counts what the model asked for.
+    fn observe_call(&mut self, call: &ToolCall) -> TracedCall {
+        self.calls_seen += 1;
+        let seq = self.calls_seen;
+        let key = format!("{}:{}", call.function_name, call.arguments);
+        let (repeat_of, prev_seq) = match self.seen.get_mut(&key) {
+            Some((first, last)) => {
+                let earlier = (Some(*first), Some(*last));
+                *last = seq;
+                earlier
+            }
+            None => {
+                self.seen.insert(key, (seq, seq));
+                (None, None)
+            }
+        };
+        TracedCall {
+            seq,
+            name: call.function_name.clone(),
+            args: call.arguments.clone(),
+            repeat_of,
+            prev_seq,
+            refused: false,
+            cache_hit: false,
+        }
+    }
 }
 
 #[async_trait]
@@ -271,7 +332,7 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     fn context_tag(&self) -> Option<String> {
-        self.context_tag.clone()
+        Some(self.tag())
     }
 
     fn response_format(&self) -> Option<AiResponseFormat> {
@@ -305,20 +366,30 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
     }
 
     async fn call_tools(&mut self, calls: Vec<ToolCall>) -> Result<Vec<(String, Value)>> {
+        self.batches += 1;
+        let tracing_on = self.tools.trace().is_some();
         let mut results: Vec<Option<(String, Value)>> = vec![None; calls.len()];
+        let mut traced: Vec<Option<TracedCall>> = (0..calls.len()).map(|_| None).collect();
         let mut to_run = Vec::new();
 
         for (idx, call) in calls.into_iter().enumerate() {
+            if tracing_on {
+                traced[idx] = Some(self.observe_call(&call));
+            }
             let repeated = self
                 .last_tool_call
                 .as_ref()
                 .is_some_and(|last| last.0 == call.function_name && last.1 == call.arguments);
             if repeated {
                 tracing::warn!(
-                    "Blocked duplicate tool call: {} with args {:?}",
+                    "{}Blocked duplicate tool call: {} with args {:?}",
+                    self.tag(),
                     call.function_name,
                     call.arguments
                 );
+                if let Some(t) = traced[idx].as_mut() {
+                    t.refused = true;
+                }
                 results[idx] = Some((
                     call.id,
                     json!({
@@ -337,15 +408,46 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                 // A rejected call is the model's to read and correct. The
                 // trait default propagates the error instead, which ends the
                 // stage and with it the review.
-                let res = match tools.call(&call.function_name, call.arguments).await {
-                    Ok(v) => v,
-                    Err(e) => json!({ "error": e.to_string() }),
+                let (res, cache_hit) = match tools
+                    .call_with_cache_status(&call.function_name, call.arguments)
+                    .await
+                {
+                    Ok(done) => done,
+                    Err(e) => (json!({ "error": e.to_string() }), false),
                 };
-                (idx, (call.id, res))
+                (idx, cache_hit, (call.id, res))
             }
         });
-        for (idx, res) in futures::future::join_all(futures).await {
+        for (idx, cache_hit, res) in futures::future::join_all(futures).await {
+            if let Some(t) = traced[idx].as_mut() {
+                t.cache_hit = cache_hit;
+            }
             results[idx] = Some(res);
+        }
+
+        if let Some(trace) = self.tools.trace() {
+            let patch = self.context_tag.as_deref().unwrap_or("").trim();
+            for (pos, t) in traced.into_iter().enumerate() {
+                let Some(t) = t else { continue };
+                let result = results[pos].as_ref().map(|(_, v)| v);
+                trace.record(json!({
+                    "event": "tool_call",
+                    "patch": patch,
+                    "stage": self.stage.name,
+                    "stage_run": self.stage_run,
+                    "batch": self.batches,
+                    "pos": pos,
+                    "seq": t.seq,
+                    "name": t.name,
+                    "args": t.args,
+                    "repeat_of": t.repeat_of,
+                    "prev_seq": t.prev_seq,
+                    "refused": t.refused,
+                    "cache_hit": t.cache_hit,
+                    "tool_error": result.is_some_and(|v| v.get("error").is_some()),
+                    "result_bytes": result.map_or(0, |v| v.to_string().len()),
+                }));
+            }
         }
 
         Ok(results.into_iter().flatten().collect())
@@ -436,6 +538,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 context_tag: env.context_tag.clone(),
                 recitation_fallback_active: false,
                 last_tool_call: None,
+                stage_run: crate::toolbox::trace::ToolTrace::next_stage_run(),
+                batches: 0,
+                calls_seen: 0,
+                seen: std::collections::HashMap::new(),
             };
 
             let runner = SessionRunner::new(env.provider.as_ref())
@@ -451,7 +557,28 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     }
                 });
 
-            runner.run(&mut session).await?
+            let run = runner.run(&mut session).await;
+            if let Some(trace) = env.tools.trace() {
+                let (ok, error, messages, usage) = match &run {
+                    Ok(r) => (true, None, r.history.len(), Some(&r.usage)),
+                    Err(e) => (false, Some(e.to_string()), 0, None),
+                };
+                trace.record(json!({
+                    "event": "stage_end",
+                    "patch": env.context_tag.as_deref().unwrap_or("").trim(),
+                    "stage": stage_name,
+                    "stage_run": session.stage_run,
+                    "ok": ok,
+                    "error": error,
+                    "batches": session.batches,
+                    "tool_calls": session.calls_seen,
+                    "messages": messages,
+                    "tokens_in": usage.map(|u| u.prompt_tokens),
+                    "tokens_out": usage.map(|u| u.completion_tokens),
+                    "tokens_cached": usage.and_then(|u| u.cached_tokens),
+                }));
+            }
+            run?
         };
 
         let tokens_in = result.usage.prompt_tokens as u32;
@@ -845,6 +972,191 @@ mod tests {
                 .contains("error"),
             "the model should see the tool's error: {:?}",
             tool_reply.content
+        );
+    }
+
+    /// Answers every call with its own arguments and counts how often it ran.
+    struct CountingTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::toolbox::framework::LlmTool<crate::toolbox::SashikoToolContext> for CountingTool {
+        fn name(&self) -> &'static str {
+            "counting_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that echoes its arguments."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": { "k": { "type": "string" } } })
+        }
+
+        async fn call(
+            &self,
+            args: Value,
+            _context: &crate::toolbox::SashikoToolContext,
+        ) -> Result<Value> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "echo": args }))
+        }
+    }
+
+    fn traced_env<'a>(
+        provider: Arc<ToolCallingProvider>,
+        mut toolbox: ToolBox,
+        base_dir: &'a std::path::Path,
+        context_tag: Option<String>,
+    ) -> (WorkflowEnv<'a>, Arc<crate::toolbox::trace::ToolTrace>) {
+        let trace = Arc::new(crate::toolbox::trace::ToolTrace::in_memory());
+        toolbox.set_trace(Some(trace.clone()));
+        let env = WorkflowEnv {
+            provider,
+            tools: Arc::new(toolbox),
+            base_dir,
+            context_tag,
+        };
+        (env, trace)
+    }
+
+    fn text_stage(name: &'static str) -> Stage<EmptyState, String> {
+        Stage::builder(name)
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build()
+    }
+
+    #[tokio::test]
+    async fn test_tool_trace_records_repeats_and_refusals() {
+        // a a b a: the second a is refused by the consecutive guard, the last
+        // one is not, and both are recorded as repeats of the first.
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a", "a", "b", "a"]));
+        let toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        let (env, trace) = traced_env(provider, toolbox, tmp.path(), None);
+
+        let (_outcome, _mutation) = text_stage("tool_trace")
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("the stage must finish");
+
+        let records = trace.records();
+        let calls: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["event"] == "tool_call")
+            .collect();
+        assert_eq!(calls.len(), 4);
+        let seqs: Vec<u64> = calls.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|r| r["refused"].as_bool().unwrap())
+                .collect::<Vec<_>>(),
+            vec![false, true, false, false]
+        );
+        assert_eq!(calls[1]["repeat_of"], 1);
+        assert_eq!(calls[1]["prev_seq"], 1);
+        assert_eq!(calls[3]["repeat_of"], 1);
+        assert_eq!(calls[3]["prev_seq"], 2);
+        assert!(calls[2]["repeat_of"].is_null());
+        // Every call here is missing its revision, so the ones that ran failed.
+        assert!(calls[0]["tool_error"].as_bool().unwrap());
+        assert!(
+            calls
+                .iter()
+                .all(|r| r["stage"] == "tool_trace" && r["batch"] == 1)
+        );
+
+        let end: Vec<&Value> = records
+            .iter()
+            .filter(|r| r["event"] == "stage_end")
+            .collect();
+        assert_eq!(end.len(), 1);
+        assert_eq!(end[0]["ok"], true);
+        assert_eq!(end[0]["tool_calls"], 4);
+        assert_eq!(end[0]["batches"], 1);
+        assert_eq!(end[0]["stage_run"], calls[0]["stage_run"]);
+    }
+
+    #[tokio::test]
+    async fn test_tool_trace_shows_repeats_served_by_the_toolbox_cache() {
+        // x y, then x y again next turn: neither repeat is consecutive, so
+        // both reach the ToolBox, which answers them from its cache.
+        let tmp = tempfile::tempdir().unwrap();
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(CountingTool { runs: runs.clone() });
+        let calls = ["x", "y"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ToolCall {
+                id: format!("call_{i}"),
+                function_name: "counting_tool".to_string(),
+                arguments: json!({ "k": k }),
+                thought_signature: None,
+            })
+            .collect();
+        let provider = Arc::new(ToolCallingProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            calls,
+            calling_turns: 2,
+        });
+        let (env, trace) = traced_env(provider, toolbox, tmp.path(), None);
+
+        let (_outcome, _mutation) = text_stage("tool_trace_cache")
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("the stage must finish");
+
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let calls: Vec<Value> = trace
+            .records()
+            .into_iter()
+            .filter(|r| r["event"] == "tool_call")
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|r| r["cache_hit"].as_bool().unwrap())
+                .collect::<Vec<_>>(),
+            vec![false, false, true, true]
+        );
+        assert_eq!(calls[2]["repeat_of"], 1);
+        assert_eq!(calls[3]["repeat_of"], 2);
+        assert_eq!(calls[2]["batch"], 2);
+        assert!(calls.iter().all(|r| !r["refused"].as_bool().unwrap()));
+        assert!(calls.iter().all(|r| !r["tool_error"].as_bool().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_context_tag_names_the_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::rejecting(&["a"]));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: Some("[ps:1 p:2] ".to_string()),
+        };
+
+        let (_outcome, _mutation) = text_stage("tagged")
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("the stage must finish");
+
+        let seen = provider.seen.lock().unwrap();
+        let tag = seen[0].context_tag.clone().unwrap();
+        assert!(tag.starts_with("[ps:1 p:2] [tagged#"), "{tag}");
+        assert!(tag.ends_with("] "), "{tag}");
+        assert!(
+            seen.iter()
+                .all(|r| r.context_tag.as_deref() == Some(tag.as_str()))
         );
     }
 }

@@ -32,6 +32,7 @@ pub mod git_ls;
 pub mod git_read_files;
 pub mod git_show;
 pub mod read_prompt;
+pub mod trace;
 
 /// The Sashiko-specific context passed to LLM tools.
 ///
@@ -68,6 +69,8 @@ pub struct ToolBox {
     /// Thread-safe cache of tool invocation results.
     /// Shared with the execution context so that tools can access it internally.
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
+    /// Where stages record their tool calls, when `SASHIKO_TOOL_TRACE` is set.
+    trace: Option<Arc<trace::ToolTrace>>,
 }
 
 impl ToolBox {
@@ -101,7 +104,18 @@ impl ToolBox {
             context,
             registry,
             cache,
+            trace: trace::ToolTrace::from_env().map(Arc::new),
         }
+    }
+
+    /// Replaces the tool call trace. Tests use it to record in memory.
+    pub fn set_trace(&mut self, trace: Option<Arc<trace::ToolTrace>>) {
+        self.trace = trace;
+    }
+
+    /// The tool call trace, if one is being recorded.
+    pub fn trace(&self) -> Option<&Arc<trace::ToolTrace>> {
+        self.trace.as_ref()
     }
 
     /// Registers an extra tool. Test-only: the review toolbox is fixed, and
@@ -154,6 +168,14 @@ impl ToolBox {
     /// It handles argument normalization, caching of final results, and dispatches
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
+        self.call_with_cache_status(name, args)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Like [`ToolBox::call`], and also reports whether the result was served
+    /// from the cache rather than by running the tool.
+    pub async fn call_with_cache_status(&self, name: &str, args: Value) -> Result<(Value, bool)> {
         let name_normalized = name.trim().to_lowercase();
         let should_cache = name_normalized != "todowrite";
         let args = utils::normalize_json_numbers(args);
@@ -169,7 +191,7 @@ impl ToolBox {
             {
                 let cache = self.cache.read().unwrap();
                 if let Some(val) = cache.get(&k) {
-                    return Ok(val.clone());
+                    return Ok((val.clone(), true));
                 }
             }
             Some(k)
@@ -187,7 +209,7 @@ impl ToolBox {
             cache.insert(k, res.clone());
         }
 
-        Ok(res)
+        Ok((res, false))
     }
 }
 
