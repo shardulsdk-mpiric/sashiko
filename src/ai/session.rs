@@ -222,6 +222,10 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        // Providers that bill hidden reasoning, Gemini's thinking tokens among
+        // them, count it only in the per-turn total, so sum that rather than
+        // rebuilding it from prompt and completion.
+        let mut total_all_tokens = 0;
 
         loop {
             turns += 1;
@@ -322,6 +326,9 @@ impl<'a> SessionRunner<'a> {
                 total_prompt_tokens += usage.prompt_tokens;
                 total_completion_tokens += usage.completion_tokens;
                 total_cached_tokens += usage.cached_tokens.unwrap_or(0);
+                total_all_tokens += usage
+                    .total_tokens
+                    .max(usage.prompt_tokens + usage.completion_tokens);
             }
 
             let assistant_msg = AiMessage {
@@ -365,7 +372,7 @@ impl<'a> SessionRunner<'a> {
                     let usage = AiUsage {
                         prompt_tokens: total_prompt_tokens,
                         completion_tokens: total_completion_tokens,
-                        total_tokens: total_prompt_tokens + total_completion_tokens,
+                        total_tokens: total_all_tokens,
                         cached_tokens: Some(total_cached_tokens),
                     };
                     return Ok(SessionResult {
@@ -492,6 +499,51 @@ mod tests {
             results[1].1,
             serde_json::json!({"error": "Tool execution failed"})
         );
+    }
+
+    #[tokio::test]
+    async fn test_session_total_keeps_tokens_outside_prompt_and_completion() {
+        // Gemini bills thinking tokens as output but reports them only in the
+        // turn's total, so the stage total must not be rebuilt from prompt
+        // and completion alone. A turn reporting no total still counts.
+        let usage = |prompt, completion, total| {
+            Some(AiUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+                cached_tokens: None,
+            })
+        };
+        let responses = vec![
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "ok".to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                }]),
+                usage: usage(100, 10, 400),
+                truncated: false,
+            },
+            AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: usage(200, 20, 0),
+                truncated: false,
+            },
+        ];
+
+        let provider = MockProvider::new(responses);
+        let runner = SessionRunner::new(&provider);
+        let res = runner.run(&mut DummySession).await.unwrap();
+        assert_eq!(res.usage.prompt_tokens, 300);
+        assert_eq!(res.usage.completion_tokens, 30);
+        assert_eq!(res.usage.total_tokens, 400 + 220);
     }
 
     #[tokio::test]

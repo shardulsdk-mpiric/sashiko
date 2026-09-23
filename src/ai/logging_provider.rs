@@ -104,10 +104,11 @@ impl AiProvider for LoggingProvider {
         }
         if let Some(usage) = &response.usage {
             info!(
-                "{tag}← Turn {turn} tokens: in={} out={} cached={}",
+                "{tag}← Turn {turn} tokens: in={} out={} cached={} total={}",
                 usage.prompt_tokens,
                 usage.completion_tokens,
-                usage.cached_tokens.unwrap_or(0)
+                usage.cached_tokens.unwrap_or(0),
+                usage.total_tokens
             );
         }
 

@@ -576,6 +576,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     "tokens_in": usage.map(|u| u.prompt_tokens),
                     "tokens_out": usage.map(|u| u.completion_tokens),
                     "tokens_cached": usage.and_then(|u| u.cached_tokens),
+                    "tokens_total": usage.map(|u| u.total_tokens),
                 }));
             }
             run?
