@@ -1,0 +1,53 @@
+# Tool-trace measurement run, Gemini. The [ai] values are upstream's shipped
+# defaults (Settings.toml), which is what hosted Sashiko runs, so the data is
+# from the reference configuration. log_turns is required: the spend guard
+# reads its token lines. Used by .claude/tools/tooltrace-run.sh.
+log_level = "info"
+
+[project]
+name = "Sashiko"
+description = ""
+
+[forge]
+enabled = false
+
+[subsystems]
+
+[database]
+url = "sashiko.db"
+token = ""
+
+[mailing_lists]
+track = ["linux-kernel"]
+
+[nntp]
+server = "nntp.lore.kernel.org"
+port = 119
+
+[server]
+host = "::"
+port = 8080
+
+[git]
+repository_path = "third_party/linux"
+
+[review]
+concurrency = 1
+worktree_dir = "<workdir>/review_trees"
+# 6 h, not 2: time spent paused for a top-up counts against it.
+timeout_seconds = 21600
+max_retries = 3
+ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+[ai]
+provider = "gemini"
+model = "gemini-3.1-pro-preview"
+max_input_tokens = 900000
+max_interactions = 100
+temperature = 1.0
+log_turns = true
+# Off on purpose. With it on, a failed patch review is not really retried:
+# attempts 2 and 3 replay attempt 1's cached responses and fail identically
+# (seen in the self-test, and the defect our U4 notes predicted). Off, a retry
+# re-pays but can succeed; the spend guard bounds the cost either way.
+response_cache = false

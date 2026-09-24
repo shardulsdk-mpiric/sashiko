@@ -1,0 +1,14 @@
+{
+ "turns": 100,
+ "in": 3328590,
+ "cached": 2599841,
+ "out_billed": 152128,
+ "usd": 3.8033,
+ "long_tier_turns": 0,
+ "cap": 0.0,
+ "tripped": null,
+ "alerts_fired": [],
+ "paused": false,
+ "pause_at": 25.0,
+ "elapsed_s": 1499
+}

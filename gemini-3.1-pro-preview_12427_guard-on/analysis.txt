@@ -1,0 +1,43 @@
+## gemini-3.1-pro-preview_12427_guard-on
+
+arm A  model gemini-3.1-pro-preview  commit f5b0734dc7d3  exit 0  est $3.8033  guard not tripped
+
+stages 8 (0 failed, 2 with no tool calls)
+tool calls 92
+  within-stage repeats       4  4.3%
+  cross-stage duplicates     4  4.3%
+  refused by the guard       2  2.2%
+  ToolBox cache hits         6  6.5%  (within-stage 2, cross-stage 4)
+  refused, cache had it      2  of 2
+
+after a refusal, the stage's next batch:
+      2  moved on to other calls
+
+within-stage repeat distance (calls back to the previous identical call):
+    1:    2   50.0%  cumulative 50.0%
+    4:    1   25.0%  cumulative 75.0%
+    6:    1   25.0%  cumulative 100.0%
+
+within-stage repeat rate by batch (model turn with tool calls):
+      1: 0/6  0.0%
+      2: 0/6  0.0%
+      3: 0/6  0.0%
+    4-5: 1/12  8.3%
+   6-10: 2/22  9.1%
+  11-20: 1/31  3.2%
+    21+: 0/9  0.0%
+
+within-stage repeat rate by tool:
+  git_grep         2/49  4.1%
+  git_show         2/43  4.7%
+
+per stage:
+  run stage                      ok    calls rep  ref  hit  batches tokens_total
+    1 pre-screen                 True      0    0    0    0       0 4596
+    2 planning                   True      0    0    0    0       0 7251
+    3 goal                       True      5    0    0    0       5 226844
+    4 implementation             True     19    0    0    0      19 597540
+    5 resources                  True     23    2    0    5      23 719531
+    6 security                   True     12    2    2    0      12 409644
+    7 locking                    True     26    0    0    1      26 1126196
+    8 execution-flow             True      7    0    0    0       7 389116

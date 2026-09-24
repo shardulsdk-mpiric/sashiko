@@ -1,0 +1,17 @@
+{
+ "arm": "A",
+ "branch": "mpiric/stage-instrumentation",
+ "commit": "f5b0734dc7d330dab30e8ab80ad2a17026183159",
+ "provider": "gemini",
+ "model": "gemini-3.1-pro-preview",
+ "settings_sha256": "ee7aff6bf64d09b36d0f183c21d658084cf4fad36c674985e4cd07160310c847",
+ "repo_head": "bb37498a99e4e3a25a47265785979402dd79de30",
+ "range": "bb37498a99e4^..bb37498a99e4",
+ "cap_usd": 0,
+ "prices": "2,12,0.2,4,18,0.4,200000",
+ "anthropic_key_kept": false,
+ "selftest": false,
+ "started": "2026-09-24T05:47:42+0530",
+ "exit_code": 0,
+ "finished": "2026-09-24T06:12:41+0530"
+}
