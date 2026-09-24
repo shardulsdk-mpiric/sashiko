@@ -143,6 +143,10 @@ pub struct Candidate {
 pub struct UsageMetadata {
     pub prompt_token_count: u32,
     pub candidates_token_count: Option<u32>,
+    /// Thinking tokens.  Billed as output but not part of
+    /// candidates_token_count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<u32>,
     pub total_token_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cached_content_token_count: Option<u32>,
@@ -552,7 +556,10 @@ impl GeminiClient {
                             crate::ai::get_log_prefix(),
                             usage.prompt_token_count.saturating_sub(cached),
                             cached,
-                            usage.candidates_token_count.unwrap_or(0)
+                            usage
+                                .candidates_token_count
+                                .unwrap_or(0)
+                                .saturating_add(usage.thoughts_token_count.unwrap_or(0))
                         );
                     } else {
                         tracing::info!(
@@ -959,7 +966,8 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
 
     let usage = resp.usage_metadata.map(|m| AiUsage {
         prompt_tokens: m.prompt_token_count as usize,
-        completion_tokens: m.candidates_token_count.unwrap_or(0) as usize,
+        completion_tokens: m.candidates_token_count.unwrap_or(0) as usize
+            + m.thoughts_token_count.unwrap_or(0) as usize,
         total_tokens: m.total_token_count as usize,
         cached_tokens: m.cached_content_token_count.map(|c| c as usize),
     });
@@ -1294,6 +1302,7 @@ mod tests {
             usage_metadata: Some(UsageMetadata {
                 prompt_token_count: 10,
                 candidates_token_count: Some(20),
+                thoughts_token_count: None,
                 total_token_count: 30,
                 cached_content_token_count: None,
                 extra: None,
@@ -1310,6 +1319,60 @@ mod tests {
             tool_calls[0].thought_signature.as_deref(),
             Some("thought_sig_xyz")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_response_counts_thinking_as_output() -> Result<()> {
+        // Gemini bills thinking tokens as output but reports them apart from
+        // candidatesTokenCount, so they must be added to completion_tokens.
+        let body = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "done"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 4360,
+                "candidatesTokenCount": 13,
+                "thoughtsTokenCount": 223,
+                "totalTokenCount": 4596
+            }
+        }"#;
+        let gemini_resp: GenerateContentResponse = serde_json::from_str(body)?;
+        let extra = gemini_resp.usage_metadata.as_ref().unwrap().extra.as_ref();
+        assert!(!extra.is_some_and(|e| e.contains_key("thoughtsTokenCount")));
+
+        let usage = translate_ai_response(gemini_resp)?.usage.unwrap();
+
+        assert_eq!(usage.prompt_tokens, 4360);
+        assert_eq!(usage.completion_tokens, 13 + 223);
+        assert_eq!(usage.total_tokens, 4596);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_response_without_thinking_count() -> Result<()> {
+        // A model with thinking off, or one that predates it, omits the
+        // field; the completion count is then candidatesTokenCount alone.
+        let body = r#"{
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "done"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 120
+            }
+        }"#;
+        let gemini_resp: GenerateContentResponse = serde_json::from_str(body)?;
+
+        let usage = translate_ai_response(gemini_resp)?.usage.unwrap();
+
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.total_tokens, 120);
 
         Ok(())
     }

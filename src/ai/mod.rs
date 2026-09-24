@@ -320,7 +320,11 @@ pub(crate) fn decode_stdio_ai_response(line: &str) -> Result<AiResponse> {
 pub struct AiUsage {
     /// Number of tokens in the input prompt.
     pub prompt_tokens: usize,
-    /// Number of tokens in the generated completion.
+    /// Number of tokens in the generated completion, including any
+    /// reasoning the provider reports as billed output.  A provider whose
+    /// API reports reasoning outside its completion count folds it in
+    /// before filling these fields.  A count estimated from the response
+    /// text covers that text only.
     pub completion_tokens: usize,
     /// Total tokens used (prompt + completion).
     pub total_tokens: usize,

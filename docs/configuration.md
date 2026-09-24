@@ -262,8 +262,8 @@ pass.
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |
 | `email_policy_path` | string | `"email_policy.toml"` | Path to the email policy file. |
-| `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
-| `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
+| `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Output includes reasoning tokens the provider bills as output, such as Gemini's thinking tokens. Set to 0 to disable. |
+| `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review, including reasoning tokens the provider bills as output, such as Gemini's thinking tokens. Set to 0 to disable. |
 
 ### `[linux_bug]`
 
