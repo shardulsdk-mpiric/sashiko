@@ -8,18 +8,17 @@ rescued by its retry. None of it needs a model or a key.
 To get this kit, next to where you will clone Sashiko:
 
 ```
-git clone --depth 1 --branch cache-tool-order-2026-09-24-v2 \
+git clone --depth 1 --branch cache-tool-order-2026-09-24-v3 \
     https://github.com/shardulsdk-mpiric/sashiko kit
 ```
 
 - Upstream main: `d0e8bfc`
 - Fix series: branch `mpiric/cache-tool-order-series` on
   https://github.com/shardulsdk-mpiric/sashiko
-  1. `fa6e1a3` ai: forget a rejected answer so a retry asks the model again
-  2. `8fea21e` ai: forget a truncated answer so a retry asks the model again
-  3. `3781577` reviewer: pass a worker's forget to the daemon's cache
-  4. `851c77d` local_review: retry without the cache when the answers were accepted
-  5. `54e9779` toolbox: list tool declarations in a stable order
+  1. `7265f85` ai: forget a rejected answer so a retry asks the model again
+  2. `37974fa` ai: forget a truncated answer so a retry asks the model again
+  3. `07bf4e9` reviewer: pass a worker's forget to the daemon's cache
+  4. `f9d6e3c` toolbox: list tool declarations in a stable order
 
 ## Unit tests
 
@@ -31,7 +30,6 @@ git checkout FETCH_HEAD
 cargo test --lib ai::cache                                   # patches 1 and 2
 cargo test --lib local_review::tests::test_decorated_provider_passes_forget_to_the_cache
 cargo test --lib reviewer::tests::test_run_review_tool_passes_a_worker_forget_to_the_provider
-cargo test --lib local_review::tests::test_attempt_ai_settings_bypasses_only_the_cache
 cargo test --lib toolbox::tools_test::tests::test_tool_declarations_come_in_a_stable_order
 make check-pr
 ```
@@ -47,7 +45,7 @@ To see the tests fail without the fixes, put back main's version of the file
 a fix changed, then rerun:
 
 ```
-git checkout d0e8bfc -- src/toolbox/framework.rs      # undo patch 5
+git checkout d0e8bfc -- src/toolbox/framework.rs      # undo patch 4
 cargo test --lib toolbox::tools_test::tests::test_tool_declarations_come_in_a_stable_order
 #   declarations are not in name order (prints the scrambled list)
 git checkout FETCH_HEAD -- src/toolbox/framework.rs
