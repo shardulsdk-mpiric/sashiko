@@ -384,6 +384,13 @@ pub trait AiProvider: Send + Sync {
     fn cache_identity(&self) -> String {
         self.get_capabilities().model_name
     }
+
+    /// Drops anything remembered for this request. The session runner calls
+    /// it when the answer to the request was rejected, so that a retry asks
+    /// the model again instead of being handed the same answer. Only the
+    /// response cache holds anything to drop; a provider that wraps another
+    /// must pass the call on, as it does `cache_stats`.
+    async fn forget(&self, _request: &AiRequest) {}
 }
 
 /// Appends the knobs a provider applies outside the request to its model name,
