@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 """A scripted stand-in for the Gemini API, so a Sashiko review can run end to
 end without a model or a key. It answers the path the Gemini provider posts
-to, v1beta/models/<model>:generateContent, and the same for every request.
+to, v1beta/models/<model>:generateContent.
 
-Every conversation that offers tools gets the same short script of tool
-calls, chosen so both duplicate cases occur:
-
-  turn 1: git_log(HEAD), git_show(HEAD)
-  turn 2: git_log(HEAD)   repeat, not consecutive: reaches the ToolBox cache
-  turn 3: git_log(HEAD)   repeat, consecutive: the guard refuses it (arm A)
-  turn 4: final answer, a minimal instance of the requested JSON schema
-
-Usage reports promptTokenCount ~ request_bytes/4, candidatesTokenCount 50,
-thoughtsTokenCount 100 and a totalTokenCount that includes them, as Gemini
-does, so the spend guard's use of total= can be checked.
+Every conversation that offers tools gets three turns of tool calls, then an
+answer. An answer is the smallest value matching the schema the request
+asks for. Usage is reported, but nothing here depends on it.
 
   fake-gemini.py PORT [DELAY_SECONDS]
 
-DELAY_SECONDS slows every answer, so a test can catch a run mid-flight.
+DELAY_SECONDS slows every answer. FAKE_REJECT_FIRST=N in the environment
+makes the first N answers to stages without tools (pre-screen, planning) not
+JSON, so the validator rejects them.
 """
 import json
 import sys
@@ -63,8 +57,20 @@ def minimal(schema, defs):
     return None
 
 
+REJECT_FIRST = int(__import__("os").environ.get("FAKE_REJECT_FIRST", "0"))
+_answers_given = [0]
+
+
 def final_answer(body):
     cfg = body.get("generationConfig") or {}
+    # FAKE_REJECT_FIRST=N: the first N answers asked of a stage without
+    # tools (pre-screen, planning) are not JSON, so the validator rejects
+    # them and that attempt of the review fails.
+    if not body.get("tools") and _answers_given[0] < REJECT_FIRST:
+        _answers_given[0] += 1
+        return "not json"
+    if not body.get("tools"):
+        _answers_given[0] += 1
     schema = cfg.get("responseSchema")
     if schema:
         defs = schema.get("$defs") or schema.get("definitions") or {}

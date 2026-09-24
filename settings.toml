@@ -1,5 +1,6 @@
-# Settings for two-runs.sh. Everything except [ai] and [review] is inert for
-# a local review. WORKTREE_DIR is filled in by the script.
+# Settings for two-runs.sh and retry-check.sh. Everything except [ai] and
+# [review] is inert for a local review. WORKTREE_DIR is filled in by the
+# script.
 log_level = "info"
 
 [project]
