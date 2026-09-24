@@ -8,17 +8,17 @@ rescued by its retry. None of it needs a model or a key.
 To get this kit, next to where you will clone Sashiko:
 
 ```
-git clone --depth 1 --branch cache-tool-order-2026-09-24-v3 \
+git clone --depth 1 --branch cache-tool-order-2026-09-24-v4 \
     https://github.com/shardulsdk-mpiric/sashiko kit
 ```
 
 - Upstream main: `d0e8bfc`
 - Fix series: branch `mpiric/cache-tool-order-series` on
   https://github.com/shardulsdk-mpiric/sashiko
-  1. `7265f85` ai: forget a rejected answer so a retry asks the model again
-  2. `37974fa` ai: forget a truncated answer so a retry asks the model again
-  3. `07bf4e9` reviewer: pass a worker's forget to the daemon's cache
-  4. `f9d6e3c` toolbox: list tool declarations in a stable order
+  1. `8f51b5f` ai: forget a rejected answer so a retry asks the model again
+  2. `57d5b41` ai: forget a truncated answer so a retry asks the model again
+  3. `c905158` reviewer: pass a worker's forget to the daemon's cache
+  4. `587455f` toolbox: list tool declarations in a stable order
 
 ## Unit tests
 
@@ -38,8 +38,8 @@ make check-pr
 Now and then a `goose_cli` or `kiro_cli` test that writes a fake executable
 and runs it fails with "Text file busy (os error 26)", and passes alone. The
 likely cause is another test starting a process while that file is still
-open for writing. Patch 3 adds one more test that starts a process, so it
-may show slightly more often; none of the series touches those tests.
+open for writing. It is not from this series: we saw it at patch 1, which
+starts no processes, and none of the series touches those tests.
 
 To see the tests fail without the fixes, put back main's version of the file
 a fix changed, then rerun:
@@ -55,6 +55,7 @@ cargo test --lib ai::cache
 #   the retry never reached the model: calls per attempt [3, 0]
 #   left: [4, 0]  right: [4, 3]
 #   left: [1, 0]  right: [1, 1]
+#   left: [2, 0]  right: [2, 2]
 git checkout FETCH_HEAD -- src/ai/session.rs
 ```
 
