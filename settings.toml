@@ -1,0 +1,26 @@
+# Settings for two-runs.sh. Everything except [ai] and [review] is inert for
+# a local review. WORKTREE_DIR is filled in by the script.
+log_level = "info"
+
+[project]
+name = "Sashiko"
+description = ""
+
+[database]
+url = "sashiko.db"
+token = ""
+
+[git]
+repository_path = "."
+
+[review]
+concurrency = 1
+worktree_dir = "WORKTREE_DIR"
+timeout_seconds = 600
+max_retries = 3
+
+[ai]
+provider = "gemini"
+model = "fake-gemini"
+log_turns = true
+response_cache = true
